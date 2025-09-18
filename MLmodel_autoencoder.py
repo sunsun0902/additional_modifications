@@ -6,7 +6,10 @@ import pandas as pd
 import os
 from sklearn.model_selection import train_test_split, KFold
 from keras.models import Sequential, Model
-from keras.layers import Input, Dense, Conv2D, Conv2DTranspose, Flatten, Reshape, Dropout
+from keras.layers import (
+    Input, Dense, Conv1D, Conv2D, Conv2DTranspose, Flatten, Reshape, Dropout,
+    BatchNormalization, ReLU, Add, GlobalAveragePooling1D, UpSampling1D, Lambda
+)
 from keras.optimizers import Adam, SGD
 import keras_tuner as kt
 import pytz
@@ -17,6 +20,50 @@ tf.config.run_functions_eagerly(True)
 
 # Define the time zone for Germany
 tzInfo = pytz.timezone('Europe/Berlin')
+
+def create_resnet_block(x, filters, kernel_sizes=[8, 5, 3], block_name="resnet_block"):
+    """
+    Create a ResNet-style convolutional block with residual connection
+
+    Args:
+        x: Input tensor
+        filters: Number of filters for conv layers
+        kernel_sizes: List of kernel sizes for the three conv layers
+        block_name: Name prefix for layers
+
+    Returns:
+        Output tensor with residual connection
+    """
+    # Store input for residual connection
+    shortcut = x
+
+    # First conv layer
+    x = Conv1D(filters, kernel_sizes[0], padding='same',
+                name=f"{block_name}_conv1")(x)
+    x = BatchNormalization(name=f"{block_name}_bn1")(x)
+    x = ReLU(name=f"{block_name}_relu1")(x)
+
+    # Second conv layer
+    x = Conv1D(filters, kernel_sizes[1], padding='same',
+                name=f"{block_name}_conv2")(x)
+    x = BatchNormalization(name=f"{block_name}_bn2")(x)
+    x = ReLU(name=f"{block_name}_relu2")(x)
+
+    # Third conv layer
+    x = Conv1D(filters, kernel_sizes[2], padding='same',
+                name=f"{block_name}_conv3")(x)
+    x = BatchNormalization(name=f"{block_name}_bn3")(x)
+
+    # Adjust shortcut dimensions if needed
+    if shortcut.shape[-1] != filters:
+        shortcut = Conv1D(filters, 1, padding='same',
+                        name=f"{block_name}_shortcut")(shortcut)
+
+    # Add residual connection
+    x = Add(name=f"{block_name}_add")([x, shortcut])
+    x = ReLU(name=f"{block_name}_relu_final")(x)
+
+    return x
 
 class AutoencoderModel:
     class HyperModel(kt.HyperModel):
@@ -36,75 +83,109 @@ class AutoencoderModel:
 
     def build_autoencoder_model(self, hp):
         """
-        Define the autoencoder model architecture with possible hyperparameters.
-        
+        Build convolutional autoencoder with ResNet-style encoder blocks using hyperparameters.
+
         Parameters:
         - hp: Hyperparameters object from Keras Tuner.
-        
+
         Returns:
-        - Keras model with the given architecture.
+        - Keras model with ResNet architecture.
         """
-        input_layer = Input(shape=self.input_shape)
+        print(f"Building tunable ResNet autoencoder with input shape {self.input_shape}")
 
-        # Encoder
-        x = Conv2D(
-            filters=hp.Int('encoder_conv1_filters', min_value=32, max_value=256, step=32),
-            kernel_size=hp.Choice('encoder_conv1_kernel_size', values=[3, 5, 7]),
-            strides=hp.Choice('encoder_conv1_strides', values=[1, 2]),
-            activation='relu',
-            padding='same'
-        )(input_layer)
-        x = Conv2D(
-            filters=hp.Int('encoder_conv2_filters', min_value=64, max_value=512, step=64),
-            kernel_size=hp.Choice('encoder_conv2_kernel_size', values=[3, 5, 7]),
-            strides=hp.Choice('encoder_conv2_strides', values=[1, 2]),
-            activation='relu',
-            padding='same'
-        )(x)
+        # ==== ENCODER ====
+        encoder_input = Input(shape=self.input_shape, name='weather_input')
+        x = encoder_input
 
-        # Bottleneck
-        shape_before_flattening = tf.keras.backend.int_shape(x)[1:]
-        x = Flatten()(x)
-        bottleneck = Dense(
-            hp.Int('bottleneck_size', min_value=16, max_value=64, step=8),
-            activation=hp.Choice('bottleneck_activation', values=['relu', 'sigmoid'])
-        )(x)
+        # Hyperparameter for number of ResNet blocks
+        num_resnet_blocks = hp.Int('num_resnet_blocks', min_value=1, max_value=5, step=1)
 
-        # Decoder
-        x = Dense(np.prod(shape_before_flattening), activation='relu')(bottleneck)
-        x = Reshape(shape_before_flattening)(x)
-        x = Conv2DTranspose(
-            filters=hp.Int('decoder_conv1_filters', min_value=64, max_value=256, step=64),
-            kernel_size=hp.Choice('decoder_conv1_kernel_size', values=[3, 5, 7]),
-            strides=hp.Choice('decoder_conv1_strides', values=[1, 2]),
-            activation='relu',
-            padding='same'
-        )(x)
-        output_layer = Conv2DTranspose(
-            filters=self.input_shape[-1],
-            kernel_size=hp.Choice('final_conv_kernel_size', values=[3, 5]),
-            activation='sigmoid',
-            padding='same'
-        )(x)
+        # Build ResNet blocks with tunable parameters
+        for i in range(num_resnet_blocks):
+            filters = hp.Choice(f'filters_block_{i}', values=[16, 32, 64])
+            x = create_resnet_block(x, filters=filters, kernel_sizes=[8, 5, 3],
+                                   block_name=f"encoder_block{i+1}")
 
-        # Autoencoder model
-        autoencoder = Model(input_layer, output_layer)
+        # Global average pooling to compress temporal dimension
+        x = GlobalAveragePooling1D(name='global_avg_pool')(x)
 
-        # Compile model
+        # Tunable latent dimension
+        latent_dim = hp.Int('latent_dim', min_value=8, max_value=64, step=4)
+        latent = Dense(latent_dim, activation='linear', name='latent_vector')(x)
+
+        # Create encoder model
+        encoder = Model(encoder_input, latent, name='encoder')
+
+        # ==== DECODER ====
+        decoder_input = Input(shape=(latent_dim,), name='latent_input')
+
+        # Expand latent vector back to a sequence
+        x = Dense(128, activation='relu', name='decoder_dense1')(decoder_input)
+        x = Dense(256, activation='relu', name='decoder_dense2')(x)
+
+        # Reshape to start sequence (32 timesteps, 20 channels to match encoder output)
+        x = Dense(32 * 20, activation='relu', name='decoder_dense3')(x)
+        x = Reshape((32, 20), name='decoder_reshape')(x)
+
+        # Upsample back to original temporal resolution
+        x = UpSampling1D(size=2, name='decoder_upsample1')(x)  # 32 -> 64
+        x = Conv1D(20, 3, padding='same', activation='relu', name='decoder_conv1')(x)
+
+        x = UpSampling1D(size=2, name='decoder_upsample2')(x)  # 64 -> 128
+        x = Conv1D(20, 3, padding='same', activation='relu', name='decoder_conv2')(x)
+
+        x = UpSampling1D(size=2, name='decoder_upsample3')(x)  # 128 -> 256
+        x = Conv1D(20, 3, padding='same', activation='relu', name='decoder_conv3')(x)
+
+        x = UpSampling1D(size=2, name='decoder_upsample4')(x)  # 256 -> 512
+        x = Conv1D(15, 3, padding='same', activation='relu', name='decoder_conv4')(x)
+
+        x = UpSampling1D(size=2, name='decoder_upsample5')(x)  # 512 -> 1024
+        x = Conv1D(15, 3, padding='same', activation='relu', name='decoder_conv5')(x)
+
+        x = UpSampling1D(size=2, name='decoder_upsample6')(x)  # 1024 -> 2048
+        x = Conv1D(15, 3, padding='same', activation='relu', name='decoder_conv6')(x)
+
+        x = UpSampling1D(size=2, name='decoder_upsample7')(x)  # 2048 -> 4096
+        x = Conv1D(15, 3, padding='same', activation='relu', name='decoder_conv7')(x)
+
+        x = UpSampling1D(size=2, name='decoder_upsample8')(x)  # 4096 -> 8192
+        x = Conv1D(self.input_shape[-1], 3, padding='same', activation='relu', name='decoder_conv8')(x)
+
+        # Fine-tune to exact length (8760)
+        x = UpSampling1D(size=2, name='decoder_upsample9')(x)  # 8192 -> 16384
+
+        # Crop to exact target length and adjust channels
+        x = Lambda(lambda x: x[:, :8760, :], name='crop_to_8760')(x)
+
+        # Final output layer with linear activation
+        decoder_output = Conv1D(self.input_shape[-1], 1, padding='same', activation='linear',
+                                name='decoder_output')(x)
+
+        # Create decoder model
+        decoder = Model(decoder_input, decoder_output, name='decoder')
+
+        # ==== COMPLETE AUTOENCODER ====
+        autoencoder_output = decoder(encoder(encoder_input))
+        autoencoder = Model(encoder_input, autoencoder_output, name='autoencoder')
+
+        # Compile model with tunable optimizer and learning rate
         optimizer_choice = hp.Choice('optimizer', ['adam', 'sgd'])
+        learning_rate = hp.Float('learning_rate', min_value=1e-5, max_value=1e-1, sampling='LOG')
+
         if optimizer_choice == 'adam':
-            optimizer = Adam(hp.Float('learning_rate', min_value=1e-5, max_value=1e-1, sampling='LOG'))
+            optimizer = Adam(learning_rate=learning_rate)
         else:
-            optimizer = SGD(hp.Float('learning_rate', min_value=1e-5, max_value=1e-1, sampling='LOG'))
-        
+            optimizer = SGD(learning_rate=learning_rate)
+
         autoencoder.compile(
             optimizer=optimizer,
             loss='mse',
             metrics=['mse']
         )
 
-        # Encoder model
-        self.encoder = Model(input_layer, bottleneck)
+        # Store encoder model
+        self.encoder = encoder
 
         return autoencoder
 
