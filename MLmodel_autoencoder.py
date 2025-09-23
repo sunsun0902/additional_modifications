@@ -7,9 +7,9 @@ import os
 from sklearn.model_selection import train_test_split, KFold
 from keras.models import Sequential, Model
 from keras.layers import (
-    Input, Dense, Conv1D, Conv2D, Conv2DTranspose, Flatten, Reshape, Dropout,
+    Input, Dense, Conv1D, Conv1DTranspose, Flatten, Reshape, Dropout,
     BatchNormalization, ReLU, Add, GlobalAveragePooling1D, UpSampling1D, Lambda
-)
+) #Add Conv1DTranspose
 from keras.optimizers import Adam, SGD
 import keras_tuner as kt
 import pytz
@@ -34,6 +34,57 @@ def create_resnet_block(x, filters, kernel_sizes=[8, 5, 3], block_name="resnet_b
     Returns:
         Output tensor with residual connection
     """
+    # Store input for residual connection
+    shortcut = x
+
+    # First conv layer
+    x = Conv1D(filters, kernel_sizes[0], padding='same',
+                name=f"{block_name}_conv1")(x)
+    x = BatchNormalization(name=f"{block_name}_bn1")(x)
+    x = ReLU(name=f"{block_name}_relu1")(x)
+
+    # Second conv layer
+    x = Conv1D(filters, kernel_sizes[1], padding='same',
+                name=f"{block_name}_conv2")(x)
+    x = BatchNormalization(name=f"{block_name}_bn2")(x)
+    x = ReLU(name=f"{block_name}_relu2")(x)
+
+    # Third conv layer
+    x = Conv1D(filters, kernel_sizes[2], padding='same',
+                name=f"{block_name}_conv3")(x)
+    x = BatchNormalization(name=f"{block_name}_bn3")(x)
+
+    # Adjust shortcut dimensions if needed
+    if shortcut.shape[-1] != filters:
+        shortcut = Conv1D(filters, 1, padding='same',
+                        name=f"{block_name}_shortcut")(shortcut)
+
+    # Add residual connection
+    x = Add(name=f"{block_name}_add")([x, shortcut])
+    x = ReLU(name=f"{block_name}_relu_final")(x)
+
+    return x
+
+def create_resnet_decoder_block(x, filters, kernel_sizes=[8, 5, 3], block_name="resnet_decoder_block",
+                               upsample=True, upsample_size=2):
+    """
+    Create a ResNet-style decoder block with residual connection and upsampling
+
+    Args:
+        x: Input tensor
+        filters: Number of filters for conv layers
+        kernel_sizes: List of kernel sizes for the three conv layers
+        block_name: Name prefix for layers
+        upsample: Whether to include upsampling at the beginning
+        upsample_size: Size of upsampling factor
+
+    Returns:
+        Output tensor with residual connection and optional upsampling
+    """
+    # Optional upsampling at the beginning
+    if upsample:
+        x = UpSampling1D(size=upsample_size, name=f"{block_name}_upsample")(x)
+
     # Store input for residual connection
     shortcut = x
 
@@ -119,46 +170,74 @@ class AutoencoderModel:
         # ==== DECODER ====
         decoder_input = Input(shape=(latent_dim,), name='latent_input')
 
-        # Expand latent vector back to a sequence
+        # Expand latent vector back to a sequence with tunable initial dimensions
+        initial_length = hp.Choice('decoder_initial_length', values=[16, 32, 64])
+        initial_filters = hp.Choice('decoder_initial_filters', values=[16, 32, 64])
+
         x = Dense(128, activation='relu', name='decoder_dense1')(decoder_input)
         x = Dense(256, activation='relu', name='decoder_dense2')(x)
+        x = Dense(initial_length * initial_filters, activation='relu', name='decoder_dense3')(x)
+        x = Reshape((initial_length, initial_filters), name='decoder_reshape')(x)
 
-        # Reshape to start sequence (32 timesteps, 20 channels to match encoder output)
-        x = Dense(32 * 20, activation='relu', name='decoder_dense3')(x)
-        x = Reshape((32, 20), name='decoder_reshape')(x)
+        # Build decoder blocks mirroring encoder structure (in reverse)
+        # Calculate number of upsampling steps needed to reach target length (8760)
+        current_length = initial_length
+        target_length = 8760
 
-        # Upsample back to original temporal resolution
-        x = UpSampling1D(size=2, name='decoder_upsample1')(x)  # 32 -> 64
-        x = Conv1D(20, 3, padding='same', activation='relu', name='decoder_conv1')(x)
+        # Modular decoder blocks with tunable parameters
+        for i in range(num_resnet_blocks):
+            # Determine if we need upsampling for this block
+            if current_length < target_length:
+                # Calculate appropriate upsample size to get closer to target
+                remaining_blocks = num_resnet_blocks - i
+                remaining_ratio = target_length / current_length
+                upsample_size = min(int(remaining_ratio ** (1.0 / remaining_blocks)), 4)
+                upsample_size = max(upsample_size, 2)  # Minimum upsample of 2
 
-        x = UpSampling1D(size=2, name='decoder_upsample2')(x)  # 64 -> 128
-        x = Conv1D(20, 3, padding='same', activation='relu', name='decoder_conv2')(x)
+                # Apply upsampling if needed
+                if current_length * upsample_size <= target_length * 2:  # Safety check
+                    current_length *= upsample_size
+                    upsample = True
+                else:
+                    upsample = False
+                    upsample_size = 1
+            else:
+                upsample = False
+                upsample_size = 1
 
-        x = UpSampling1D(size=2, name='decoder_upsample3')(x)  # 128 -> 256
-        x = Conv1D(20, 3, padding='same', activation='relu', name='decoder_conv3')(x)
+            # Get tunable filters for this decoder block (reverse order from encoder)
+            reverse_idx = num_resnet_blocks - 1 - i
+            filters = hp.Choice(f'decoder_filters_block_{i}', values=[16, 32, 64])
 
-        x = UpSampling1D(size=2, name='decoder_upsample4')(x)  # 256 -> 512
-        x = Conv1D(15, 3, padding='same', activation='relu', name='decoder_conv4')(x)
+            x = create_resnet_decoder_block(
+                x,
+                filters=filters,
+                kernel_sizes=[8, 5, 3],
+                block_name=f"decoder_block{i+1}",
+                upsample=upsample,
+                upsample_size=upsample_size
+            )
 
-        x = UpSampling1D(size=2, name='decoder_upsample5')(x)  # 512 -> 1024
-        x = Conv1D(15, 3, padding='same', activation='relu', name='decoder_conv5')(x)
+        # Final upsampling and adjustments to reach exact target length
+        while current_length < target_length:
+            if current_length * 2 <= target_length:
+                x = UpSampling1D(size=2, name=f'decoder_final_upsample_{current_length}')(x)
+                current_length *= 2
+            else:
+                break
 
-        x = UpSampling1D(size=2, name='decoder_upsample6')(x)  # 1024 -> 2048
-        x = Conv1D(15, 3, padding='same', activation='relu', name='decoder_conv6')(x)
+        # Crop or pad to exact target length if needed
+        if current_length != target_length:
+            if current_length > target_length:
+                # Crop to exact length
+                x = Lambda(lambda x: x[:, :target_length, :], name='crop_to_target')(x)
+            else:
+                # Pad if needed (though this should be rare with proper upsampling)
+                padding_needed = target_length - current_length
+                x = Lambda(lambda x: tf.pad(x, [[0, 0], [0, padding_needed], [0, 0]],
+                                          mode='REFLECT'), name='pad_to_target')(x)
 
-        x = UpSampling1D(size=2, name='decoder_upsample7')(x)  # 2048 -> 4096
-        x = Conv1D(15, 3, padding='same', activation='relu', name='decoder_conv7')(x)
-
-        x = UpSampling1D(size=2, name='decoder_upsample8')(x)  # 4096 -> 8192
-        x = Conv1D(self.input_shape[-1], 3, padding='same', activation='relu', name='decoder_conv8')(x)
-
-        # Fine-tune to exact length (8760)
-        x = UpSampling1D(size=2, name='decoder_upsample9')(x)  # 8192 -> 16384
-
-        # Crop to exact target length and adjust channels
-        x = Lambda(lambda x: x[:, :8760, :], name='crop_to_8760')(x)
-
-        # Final output layer with linear activation
+        # Final output layer with linear activation to match input features
         decoder_output = Conv1D(self.input_shape[-1], 1, padding='same', activation='linear',
                                 name='decoder_output')(x)
 
